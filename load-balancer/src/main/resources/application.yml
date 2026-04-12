@@ -1,0 +1,12 @@
+server:
+  port: 8080
+
+backend:
+  instances:
+    - http://app1:8081
+    - http://app2:8082
+    - http://app3:8083
+
+spring:
+  application:
+    name: load-balancer
