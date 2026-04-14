@@ -1,0 +1,105 @@
+name: CI Smoke Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build and start stack
+        run: docker compose up -d --build
+
+      - name: Wait for load balancer health
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in {1..60}; do
+            if curl -fsS http://localhost:8080/actuator/health >/dev/null; then
+              echo "Load balancer is healthy"
+              exit 0
+            fi
+            echo "Waiting for services... ($i/60)"
+            sleep 5
+          done
+          echo "Services did not become healthy in time"
+          docker compose ps
+          exit 1
+
+      - name: Smoke test shorten and redirect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BODY='{"longUrl":"https://example.com/docs"}'
+          RESP=$(curl -fsS -X POST \
+            -H 'Content-Type: application/json' \
+            -H 'X-User-Id: 101' \
+            -d "$BODY" \
+            http://localhost:8080/shorten)
+
+          echo "Shorten response: $RESP"
+
+          export RESP
+          SHORT_ID=$(python3 -c "import json, os; print(json.loads(os.environ['RESP']).get('shortId',''))")
+
+          if [ -z "$SHORT_ID" ]; then
+            echo "shortId missing in response"
+            exit 1
+          fi
+
+          STATUS=$(curl -sS -o /tmp/headers.txt -D /tmp/headers.txt -w '%{http_code}' "http://localhost:8080/$SHORT_ID")
+          if [ "$STATUS" != "302" ]; then
+            echo "Expected 302 redirect, got $STATUS"
+            cat /tmp/headers.txt
+            exit 1
+          fi
+
+          if ! grep -qi '^Location: https://example.com/docs' /tmp/headers.txt; then
+            echo "Redirect location mismatch"
+            cat /tmp/headers.txt
+            exit 1
+          fi
+
+      - name: Smoke test rate limit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BODY='{"longUrl":"https://example.com/rate"}'
+          USER=202
+          HIT_429=0
+
+          for i in {1..7}; do
+            CODE=$(curl -sS -o /tmp/rl.txt -w '%{http_code}' -X POST \
+              -H 'Content-Type: application/json' \
+              -H "X-User-Id: $USER" \
+              -d "$BODY" \
+              http://localhost:8080/shorten)
+            echo "Request $i -> $CODE"
+            if [ "$CODE" = "429" ]; then
+              HIT_429=1
+              break
+            fi
+          done
+
+          if [ "$HIT_429" -ne 1 ]; then
+            echo "Expected at least one 429 after burst requests"
+            exit 1
+          fi
+
+      - name: Service logs on failure
+        if: failure()
+        run: docker compose logs --no-color
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
